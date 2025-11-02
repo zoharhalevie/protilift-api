@@ -18,8 +18,8 @@ app.use((req, res, next) => {
 });
 
 /* ====== החלף כאן לערכים האמיתיים שלך, עם מרכאות ====== */
-const IOS_CLIENT_ID = "413679716774-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX.apps.googleusercontent.com";
-const WEB_CLIENT_ID = "413679716774-YYYYYYYYYYYYYYYYYYYYYYYYYYYYYYYY.apps.googleusercontent.com";
+const IOS_CLIENT_ID = "413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com";
+const WEB_CLIENT_ID = "413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com";
 /* ====================================================== */
 
 // בדיקת פורמט IDs

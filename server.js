@@ -1,141 +1,147 @@
-// server.js — API קטן לאימות Google ומעקב סשן
+// server.js — Protilift API (Railway safe)
+// יציב נגד נפילות: בודק env, מאזין ל־PORT של Railway, ולא זורק שגיאות לא מטופלות
 
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const { OAuth2Client } = require('google-auth-library');
-const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
 
-// לוג פשוט לכל בקשה
-app.use((req, res, next) => {
-  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-  next();
+// ---- קונפיג ----
+const PORT = process.env.PORT || 8080;             // Railway מספק PORT
+const 413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com = process.env.IOS_CLIENT_ID || '';
+const 413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com = process.env.WEB_CLIENT_ID || ''; // רשות
+
+// לא להפיל את התהליך אם env חסר — רק נתריע בלוגים
+if (!IOS_CLIENT_ID) {
+  console.warn('[WARN] IOS_CLIENT_ID is missing! /api/auth/google-idtoken will return 500 until you set it.');
+}
+
+const googleClient = new OAuth2Client({
+  clientId: IOS_CLIENT_ID || undefined,
 });
 
-// ====== CONFIG ======
-const 413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com = process.env.IOS_CLIENT_ID || '';   // לדוגמה: 4136...apps.googleusercontent.com
-const 413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com = process.env.WEB_CLIENT_ID || '';   // לדוגמה: 4136...apps.googleusercontent.com
-
-// ====== זיכרון לסשנים (לבדיקות/POC). בפרודקשן שים Redis/DB ======
-/** @type {Map<string, {email:string, sub:string, createdAt:number}>} */
+// “מסד זמני” בזיכרון (Session Map)
 const sessions = new Map();
 
-// ====== עזר ======
-function makeSid() {
-  return crypto.randomUUID().replace(/-/g, '');
-}
-function getSidFromAnywhere(req) {
-  return (
-    req.cookies?.session ||
-    req.get('x-session') ||
-    req.query.session ||
-    (req.body && req.body.session) ||
-    null
-  );
-}
+// ---- בריאות/דיבוג ----
+app.get('/ok', (req, res) => res.type('text/plain').send('OK'));
 
-// ====== בריאות/דיבוג ======
-app.get('/', (_, res) => res.send('OK'));
-app.get('/ok', (_, res) => res.send('OK'));
-app.get('/hello', (_, res) => {
+app.get('/hello', (req, res) => {
   res.json({
     ok: true,
     from: 'node',
-    ts: Date.now(),
     env: {
       hasIOS: !!IOS_CLIENT_ID,
       hasWEB: !!WEB_CLIENT_ID,
+      port: PORT,
+      node: process.version,
     },
   });
 });
-app.get('/debug-config', (_, res) => {
+
+app.get('/debug-config', (req, res) => {
   res.json({
     ok: true,
-    IOS_CLIENT_ID: IOS_CLIENT_ID || '(missing)',
-    WEB_CLIENT_ID: WEB_CLIENT_ID || '(missing)',
-    sessionsCount: sessions.size,
+    IOS_CLIENT_ID_present: !!IOS_CLIENT_ID,
+    WEB_CLIENT_ID_present: !!WEB_CLIENT_ID,
+    sessionsSize: sessions.size,
   });
 });
 
-// ====== אימות Google ID Token ======
-// iOS → תשלח platform = "ios"
-// Web  → תשלח platform = "web" (או תשאיר ריק — יחשב כ-web)
+// מי אני (ללא/עם sid בפרמטר/כותרת/קוקי)
+app.get('/whoami', (req, res) => {
+  const fromCookie = req.cookies?.session || null;
+  const fromHeader = req.get('x-session') || null;
+  const fromQuery  = req.query.session || null;
+  const sid = fromCookie || fromHeader || fromQuery || null;
+  const user = sid ? sessions.get(sid) : null;
+
+  res.json({
+    sid,
+    fromHeader: !!fromHeader,
+    fromQuery: !!fromQuery,
+    hasCookie: !!fromCookie,
+    loggedIn: !!user,
+    user: user || null,
+  });
+});
+
+// בדיקת סשן (שימושי לאפליקציה/ווב)
+app.get('/api/auth/session/validate', (req, res) => {
+  const sid = req.cookies?.session || req.get('x-session') || req.query.session;
+  if (!sid) return res.status(401).json({ ok: false, err: 'no sid' });
+  const user = sessions.get(sid);
+  if (!user) return res.status(401).json({ ok: false, err: 'invalid sid' });
+  res.json({ ok: true, user });
+});
+
+// ---- אימות Google IdToken מה-iOS ----
 app.post('/api/auth/google-idtoken', async (req, res) => {
   try {
-    const { idToken, platform } = req.body || {};
+    if (!IOS_CLIENT_ID) {
+      return res.status(500).json({ ok: false, err: 'IOS_CLIENT_ID missing on server' });
+    }
+
+    // נקבל את ה-idToken מגוף הבקשה או מכותרת
+    const idToken =
+      req.body?.idToken ||
+      req.get('x-id-token') ||
+      (typeof req.body === 'string' ? req.body : '');
+
     if (!idToken) {
       return res.status(400).json({ ok: false, err: 'missing idToken' });
     }
-    const isIOS = String(platform || '').toLowerCase() === 'ios';
-    const expectedAud = isIOS ? IOS_CLIENT_ID : WEB_CLIENT_ID;
-    if (!expectedAud) {
-      return res.status(500).json({ ok: false, err: 'server missing client id env' });
+
+    // אימות הטוקן מול ה-audience של iOS
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: IOS_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+
+    if (!payload) {
+      return res.status(401).json({ ok: false, err: 'no payload' });
     }
 
-    // מאמתים את ה-idToken מול ה-audience המתאים
-    const client = new OAuth2Client(expectedAud);
-    const ticket = await client.verifyIdToken({
-      idToken,
-      audience: expectedAud,
+    // אפשר לדרוש גם aud == IOS_CLIENT_ID במפורש:
+    if (payload.aud && payload.aud !== IOS_CLIENT_ID) {
+      return res.status(401).json({ ok: false, err: 'Wrong recipient, payload.aud != IOS_CLIENT_ID' });
+    }
+
+    // יצירת sid ושמירת משתמש
+    const sid = `${payload.sub}.${Date.now()}`;
+    const user = {
+      sub: payload.sub,
+      email: payload.email,
+      name: payload.name || '',
+      picture: payload.picture || '',
+      provider: 'google',
+    };
+    sessions.set(sid, user);
+
+    // קבע קוקי (רשות—נוח לווב)
+    res.cookie('session', sid, {
+      httpOnly: false,
+      sameSite: 'Lax',
+      secure: true,
+      maxAge: 1000 * 60 * 60 * 24 * 7, // שבוע
     });
-    const payload = ticket.getPayload(); // email, sub, aud, exp, ...
-    const email = payload.email || '';
-    const sub = payload.sub || '';
 
-    // נוציא sid ונשמור בזיכרון
-    const sid = makeSid();
-    sessions.set(sid, { email, sub, createdAt: Date.now() });
-
-    // הערה חשובה:
-    // כאן אנחנו לא מגדירים cookie ל-domain של protilift.com,
-    // כי דפדפן מרחוק (railway.app) לא יכול לקבוע cookie עבור דומיין אחר.
-    // את ה-cookie תשבץ באפליקציית iOS (WKHTTPCookieStore) או בצד האתר,
-    // ואנחנו נחזיר לך את ה-sid בגוף.
-    return res.json({ ok: true, sid, email, sub });
+    res.json({ ok: true, sid, user });
   } catch (err) {
-    console.error('verify idToken error:', err?.message || err);
-    return res.status(401).json({ ok: false, err: 'invalid token' });
+    console.error('verify error:', err?.message || err);
+    res.status(401).json({ ok: false, err: err?.message || 'verify failed' });
   }
 });
 
-// ====== ולבקשתך: בדיקת סשן ו־whoami ======
-
-// בדיקת סשן — מוודא שה-sid תקף ומחזיר את המשתמש
-app.get('/api/auth/session/validate', (req, res) => {
-  const sid = getSidFromAnywhere(req);
-  if (!sid) return res.status(401).json({ ok: false, err: 'no sid' });
-
-  const user = sessions.get(sid);
-  if (!user) return res.status(401).json({ ok: false, err: 'invalid sid' });
-
-  return res.json({ ok: true, user });
+// ---- האזנה (Railway) ----
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`listening on http://0.0.0.0:${PORT}`);
 });
 
-// למעקב עצמי / דיבוג מהיר: לראות האם מגיע sid ואיך
-app.get('/whoami', (req, res) => {
-  const sid =
-    req.cookies?.session ||
-    req.get('x-session') ||
-    req.query.session ||
-    (req.body && req.body.session) ||
-    null;
-
-  const user = sid ? sessions.get(sid) : null;
-  res.json({
-    hasCookie: !!req.cookies?.session,
-    fromHeader: !!req.get('x-session'),
-    fromQuery: !!req.query.session,
-    sid: sid || null,
-    loggedIn: !!user,
-    user,
-  });
-});
-
-// ====== הפעלה ======
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`listening on http://localhost:${PORT}`);
-});
+// לא להפיל את התהליך על הבטחות לא מטופלות
+process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));
+process.on('uncaughtException', (e) => console.error('uncaughtException', e));

@@ -1,172 +1,141 @@
-// server.js — protilift pilot (v5)
-// תומך: Google (idToken), Apple (idToken — פיילוט, בלי אימות מלא), Email+Password (bcrypt)
-// מחזיר sessionId ב-JSON; באפליקציה מייצרים Cookie ל-protilift.com
+// server.js — API קטן לאימות Google ומעקב סשן
 
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const { OAuth2Client } = require('google-auth-library');
-const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
 app.use(cookieParser());
 
-// לוג לכל בקשה
+// לוג פשוט לכל בקשה
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   next();
 });
 
-/* ====== החלף כאן לערכים האמיתיים שלך, עם מרכאות ====== */
-const IOS_CLIENT_ID = "413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com";
-const WEB_CLIENT_ID = "413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com";
-/* ====================================================== */
+// ====== CONFIG ======
+const 413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com = process.env.IOS_CLIENT_ID || '';   // לדוגמה: 4136...apps.googleusercontent.com
+const 413679716774-eulnpt2b3l99qvs9j2erdo3lgdivf56r.apps.googleusercontent.com = process.env.WEB_CLIENT_ID || '';   // לדוגמה: 4136...apps.googleusercontent.com
 
-// בדיקת פורמט IDs
-function assertCID(name, value) {
-  if (typeof value !== 'string') throw new Error(`${name} must be a string (missing quotes?)`);
-  if (!value.includes('.apps.googleusercontent.com')) throw new Error(`${name} looks wrong: ${value}`);
+// ====== זיכרון לסשנים (לבדיקות/POC). בפרודקשן שים Redis/DB ======
+/** @type {Map<string, {email:string, sub:string, createdAt:number}>} */
+const sessions = new Map();
+
+// ====== עזר ======
+function makeSid() {
+  return crypto.randomUUID().replace(/-/g, '');
 }
-assertCID('IOS_CLIENT_ID', IOS_CLIENT_ID);
-assertCID('WEB_CLIENT_ID', WEB_CLIENT_ID);
-
-console.log(`[BOOT v5] IOS_CLIENT_ID: ${IOS_CLIENT_ID.slice(0, 14)}...`);
-console.log(`[BOOT v5] WEB_CLIENT_ID: ${WEB_CLIENT_ID.slice(0, 14)}...`);
-
-// זיכרון לפיילוט (במקום DB)
-const client = new OAuth2Client(WEB_CLIENT_ID);
-const sessions = new Map();      // sessionId -> { userId, email, name, provider, createdAt }
-const usersByEmail = new Map();  // email -> { userId, email, name, passHash }
-
-// utils
-function newSession(user) {
-  const sessionId = `sess_${user.userId}_${Date.now()}`;
-  sessions.set(sessionId, { ...user, createdAt: Date.now() });
-  return sessionId;
+function getSidFromAnywhere(req) {
+  return (
+    req.cookies?.session ||
+    req.get('x-session') ||
+    req.query.session ||
+    (req.body && req.body.session) ||
+    null
+  );
 }
 
-// בריאות/בדיקות
-app.get('/', (req, res) => res.json({ status: 'OK', version: 'v5', at: new Date().toISOString() }));
-app.get('/ok', (req, res) => res.type('text/plain').send('OK'));
-app.get('/hello', (req, res) => res.json({ ok: true, from: 'node', version: 'v5', ts: Date.now() }));
-
-// (בדיקות בלבד — מחק לפני פרוד)
-app.get('/debug-config', (req, res) => {
-  res.json({ ok: true, version: 'v5', ios: IOS_CLIENT_ID, web: WEB_CLIENT_ID, users: usersByEmail.size, sessions: sessions.size });
+// ====== בריאות/דיבוג ======
+app.get('/', (_, res) => res.send('OK'));
+app.get('/ok', (_, res) => res.send('OK'));
+app.get('/hello', (_, res) => {
+  res.json({
+    ok: true,
+    from: 'node',
+    ts: Date.now(),
+    env: {
+      hasIOS: !!IOS_CLIENT_ID,
+      hasWEB: !!WEB_CLIENT_ID,
+    },
+  });
+});
+app.get('/debug-config', (_, res) => {
+  res.json({
+    ok: true,
+    IOS_CLIENT_ID: IOS_CLIENT_ID || '(missing)',
+    WEB_CLIENT_ID: WEB_CLIENT_ID || '(missing)',
+    sessionsCount: sessions.size,
+  });
 });
 
-/* ---------------------- GOOGLE ---------------------- */
-// מקבל idToken מגוגל ומחזיר sessionId
+// ====== אימות Google ID Token ======
+// iOS → תשלח platform = "ios"
+// Web  → תשלח platform = "web" (או תשאיר ריק — יחשב כ-web)
 app.post('/api/auth/google-idtoken', async (req, res) => {
   try {
-    const { idToken } = req.body || {};
-    if (!idToken) return res.status(400).json({ ok:false, err:'missing token' });
+    const { idToken, platform } = req.body || {};
+    if (!idToken) {
+      return res.status(400).json({ ok: false, err: 'missing idToken' });
+    }
+    const isIOS = String(platform || '').toLowerCase() === 'ios';
+    const expectedAud = isIOS ? IOS_CLIENT_ID : WEB_CLIENT_ID;
+    if (!expectedAud) {
+      return res.status(500).json({ ok: false, err: 'server missing client id env' });
+    }
 
+    // מאמתים את ה-idToken מול ה-audience המתאים
+    const client = new OAuth2Client(expectedAud);
     const ticket = await client.verifyIdToken({
       idToken,
-      audience: [IOS_CLIENT_ID, WEB_CLIENT_ID],
+      audience: expectedAud,
     });
-    const payload = ticket.getPayload();
-    const user = {
-      userId: payload.sub,
-      email: payload.email || null,
-      name: payload.name || null,
-      provider: 'google',
-    };
-    const sessionId = newSession(user);
-    return res.status(200).json({ ok: true, sessionId });
+    const payload = ticket.getPayload(); // email, sub, aud, exp, ...
+    const email = payload.email || '';
+    const sub = payload.sub || '';
+
+    // נוציא sid ונשמור בזיכרון
+    const sid = makeSid();
+    sessions.set(sid, { email, sub, createdAt: Date.now() });
+
+    // הערה חשובה:
+    // כאן אנחנו לא מגדירים cookie ל-domain של protilift.com,
+    // כי דפדפן מרחוק (railway.app) לא יכול לקבוע cookie עבור דומיין אחר.
+    // את ה-cookie תשבץ באפליקציית iOS (WKHTTPCookieStore) או בצד האתר,
+    // ואנחנו נחזיר לך את ה-sid בגוף.
+    return res.json({ ok: true, sid, email, sub });
   } catch (err) {
-    console.error('GOOGLE VERIFY ERROR:', err?.message || err);
-    return res.status(401).json({ ok:false, err:String(err?.message || err) });
+    console.error('verify idToken error:', err?.message || err);
+    return res.status(401).json({ ok: false, err: 'invalid token' });
   }
 });
 
-/* ---------------------- APPLE ----------------------- */
-// פיילוט: מקבל idToken של Apple ומייצר סשן — בלי אימות חתימה מלא (לפרוד צריך לאמת מול public keys של Apple)
-app.post('/api/auth/apple-idtoken', async (req, res) => {
-  try {
-    const { idToken } = req.body || {};
-    if (!idToken) return res.status(400).json({ ok:false, err:'missing token' });
+// ====== ולבקשתך: בדיקת סשן ו־whoami ======
 
-    // ⚠️ לפיילוט — נחלץ רק את ה-Subject (sub) מתוך ה-JWT בצורה נאיבית:
-    // פורמט JWT: header.payload.signature (Base64URL). ננסה לקרוא payload.
-    const parts = String(idToken).split('.');
-    if (parts.length < 2) throw new Error('invalid apple token');
-    const payloadJson = Buffer.from(parts[1].replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString('utf8');
-    const payload = JSON.parse(payloadJson);
-
-    const user = {
-      userId: payload.sub || `apple_${Date.now()}`,
-      email: payload.email || null,
-      name: null,
-      provider: 'apple',
-    };
-    const sessionId = newSession(user);
-    return res.status(200).json({ ok: true, sessionId });
-  } catch (err) {
-    console.error('APPLE PARSE ERROR:', err?.message || err);
-    return res.status(401).json({ ok:false, err:String(err?.message || err) });
-  }
-});
-
-/* ---------------- Email + Password ------------------ */
-// הרשמה
-app.post('/api/auth/signup', async (req, res) => {
-  try {
-    const { email, password, name } = req.body || {};
-    if (!email || !password) return res.status(400).json({ ok:false, err:'missing email/password' });
-    if (usersByEmail.has(email)) return res.status(409).json({ ok:false, err:'email exists' });
-
-    const passHash = await bcrypt.hash(password, 10);
-    const user = { userId: `local_${Date.now()}`, email, name: name || null, passHash, provider: 'local' };
-    usersByEmail.set(email, user);
-    const sessionId = newSession(user);
-    return res.status(200).json({ ok:true, sessionId });
-  } catch (err) {
-    console.error('SIGNUP ERROR:', err?.message || err);
-    return res.status(500).json({ ok:false, err:'signup failed' });
-  }
-});
-
-// כניסה
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ ok:false, err:'missing email/password' });
-
-    const user = usersByEmail.get(email);
-    if (!user) return res.status(401).json({ ok:false, err:'bad credentials' });
-    const ok = await bcrypt.compare(password, user.passHash);
-    if (!ok) return res.status(401).json({ ok:false, err:'bad credentials' });
-
-    const sessionId = newSession(user);
-    return res.status(200).json({ ok:true, sessionId });
-  } catch (err) {
-    console.error('LOGIN ERROR:', err?.message || err);
-    return res.status(500).json({ ok:false, err:'login failed' });
-  }
-});
-
-/* --------------------- WHOAMI ----------------------- */
-// בדיקות: אפשר להעביר sessionId ב-query/header/cookie
-app.get('/whoami', (req, res) => {
-  const sidFromQuery  = req.query.sessionId;
-  const sidFromHeader = req.get('x-session-id');
-  const sidFromCookie = (req.cookies && req.cookies.session) || null;
-  const sid = sidFromQuery || sidFromHeader || sidFromCookie;
-
-  if (!sid) return res.status(401).json({ ok:false, err:'no session provided' });
+// בדיקת סשן — מוודא שה-sid תקף ומחזיר את המשתמש
+app.get('/api/auth/session/validate', (req, res) => {
+  const sid = getSidFromAnywhere(req);
+  if (!sid) return res.status(401).json({ ok: false, err: 'no sid' });
 
   const user = sessions.get(sid);
-  if (!user) return res.status(401).json({ ok:false, err:'invalid session' });
+  if (!user) return res.status(401).json({ ok: false, err: 'invalid sid' });
 
-  res.json({ ok:true, user });
+  return res.json({ ok: true, user });
 });
 
-// 404 ידידותי
-app.use((req, res) => {
-  res.status(404).json({ ok:false, err:'not found', path: req.path, version: 'v5' });
+// למעקב עצמי / דיבוג מהיר: לראות האם מגיע sid ואיך
+app.get('/whoami', (req, res) => {
+  const sid =
+    req.cookies?.session ||
+    req.get('x-session') ||
+    req.query.session ||
+    (req.body && req.body.session) ||
+    null;
+
+  const user = sid ? sessions.get(sid) : null;
+  res.json({
+    hasCookie: !!req.cookies?.session,
+    fromHeader: !!req.get('x-session'),
+    fromQuery: !!req.query.session,
+    sid: sid || null,
+    loggedIn: !!user,
+    user,
+  });
 });
 
+// ====== הפעלה ======
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`listening on http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`listening on http://localhost:${PORT}`);
+});

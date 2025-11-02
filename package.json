@@ -7,8 +7,9 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "cookie-parser": "^1.4.7",
-    "express": "^5.1.0",
-    "google-auth-library": "^10.4.2"
+  "cookie-parser": "^1.4.7",
+  "express": "^5.1.0",
+  "google-auth-library": "^10.4.2",
+  "bcryptjs": "^2.4.3"
   }
 }

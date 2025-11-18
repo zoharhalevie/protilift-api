@@ -1,15 +1,13 @@
 {
   "name": "protilift-api",
   "version": "1.0.0",
-  "description": "Protilift iOS auth API",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "cookie-parser": "^1.4.6",
     "express": "^4.19.2",
-    "google-auth-library": "^9.14.1"
+    "google-auth-library": "^9.0.0"
   }
 }
